@@ -28,7 +28,7 @@ PROJECT_ROOT = rootutils.setup_root(
     pythonpath=True,
 )
 
-from src.viaABC.metrics import l2_distance, pairwise_cosine  # noqa: E402
+from src.viaABC.metrics import l2_distance, pairwise_cosine, pairwise_wasserstein_diagonal  # noqa: E402
 from src.viaABC.systems import Spatial2D  # noqa: E402
 
 
@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prior-low", default="0,0")
     parser.add_argument("--prior-high", default="1,1")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--short", action="store_true", help="Run a tiny probe suitable for quick metric validation.")
     return parser.parse_args()
 
 
@@ -162,18 +163,60 @@ def latent_distance_breakdown(
     system: Spatial2D,
     obs_z: np.ndarray,
     sim_z: np.ndarray,
+    obs_dist: dict[str, np.ndarray] | None = None,
+    sim_dist: dict[str, np.ndarray] | None = None,
 ) -> dict[str, float]:
     obs_z = np.asarray(obs_z)
     sim_z = np.asarray(sim_z)
     obs_frames = split_frame_tokens(system, obs_z)
     sim_frames = split_frame_tokens(system, sim_z)
-    return {
+    metrics = {
         "latent_pairwise_cosine": float(1.0 - pairwise_cosine(obs_z, sim_z)),
         "latent_token_cosine": cosine_distance_tokens(obs_z, sim_z),
         "latent_l2": float(l2_distance(obs_z, sim_z)),
         "latent_frame0_cosine": cosine_distance_tokens(obs_frames[:, 0], sim_frames[:, 0]),
         "latent_frame1_cosine": cosine_distance_tokens(obs_frames[:, 1], sim_frames[:, 1]),
     }
+    if obs_dist is not None and sim_dist is not None:
+        metrics["latent_wasserstein"] = float(
+            np.mean(
+                pairwise_wasserstein_diagonal(
+                    obs_dist["mu"],
+                    obs_dist["sigma"],
+                    sim_dist["mu"],
+                    sim_dist["sigma"],
+                )
+            )
+        )
+        obs_mu_frames = split_frame_tokens(system, obs_dist["mu"])
+        sim_mu_frames = split_frame_tokens(system, sim_dist["mu"])
+        obs_sigma_frames = split_frame_tokens(system, obs_dist["sigma"])
+        sim_sigma_frames = split_frame_tokens(system, sim_dist["sigma"])
+        metrics["latent_frame0_wasserstein"] = float(
+            np.mean(
+                pairwise_wasserstein_diagonal(
+                    obs_mu_frames[:, 0],
+                    obs_sigma_frames[:, 0],
+                    sim_mu_frames[:, 0],
+                    sim_sigma_frames[:, 0],
+                )
+            )
+        )
+        metrics["latent_frame1_wasserstein"] = float(
+            np.mean(
+                pairwise_wasserstein_diagonal(
+                    obs_mu_frames[:, 1],
+                    obs_sigma_frames[:, 1],
+                    sim_mu_frames[:, 1],
+                    sim_sigma_frames[:, 1],
+                )
+            )
+        )
+    else:
+        metrics["latent_wasserstein"] = math.nan
+        metrics["latent_frame0_wasserstein"] = math.nan
+        metrics["latent_frame1_wasserstein"] = math.nan
+    return metrics
 
 
 def raw_grid_metrics(
@@ -199,9 +242,26 @@ def raw_grid_metrics(
     }
 
 
-def encode_label_pairs(system: Spatial2D, pairs: np.ndarray) -> np.ndarray:
+def copy_distribution(distribution: dict[str, np.ndarray] | None) -> dict[str, np.ndarray] | None:
+    if distribution is None:
+        return None
+    return {key: np.array(value, copy=True) for key, value in distribution.items()}
+
+
+def observation_distribution(system: Spatial2D, sample_index: int) -> dict[str, np.ndarray] | None:
+    distribution = system.encoded_observational_distribution
+    if distribution is None:
+        return None
+    return {
+        key: value[sample_index : sample_index + 1]
+        for key, value in distribution.items()
+    }
+
+
+def encode_label_pairs(system: Spatial2D, pairs: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray] | None]:
     with torch.inference_mode():
-        return system.get_latent(system.preprocess(pairs))
+        latent = system.get_latent(system.preprocess(pairs))
+    return latent, copy_distribution(system._last_latent_distribution)
 
 
 def compare_one_pair(
@@ -212,14 +272,14 @@ def compare_one_pair(
     theta: np.ndarray | None = None,
 ) -> dict[str, object]:
     obs_z = system.encoded_observational_data[sample_index : sample_index + 1]
-    sim_z = encode_label_pairs(system, pair[np.newaxis, ...])
+    sim_z, sim_dist = encode_label_pairs(system, pair[np.newaxis, ...])
     row: dict[str, object] = {
         "label": label,
         "theta_alpha": float(theta[0]) if theta is not None else math.nan,
         "theta_beta": float(theta[1]) if theta is not None else math.nan,
         "sample_index": sample_index,
     }
-    row.update(latent_distance_breakdown(system, obs_z, sim_z))
+    row.update(latent_distance_breakdown(system, obs_z, sim_z, observation_distribution(system, sample_index), sim_dist))
     row.update(
         raw_grid_metrics(
             system._initial_grids[sample_index],
@@ -244,13 +304,14 @@ def compare_one_preprocessed_pair(
     obs_z = system.encoded_observational_data[sample_index : sample_index + 1]
     with torch.inference_mode():
         sim_z = system.get_latent(preprocessed_pair[np.newaxis, ...])
+    sim_dist = copy_distribution(system._last_latent_distribution)
     row: dict[str, object] = {
         "label": label,
         "theta_alpha": math.nan,
         "theta_beta": math.nan,
         "sample_index": sample_index,
     }
-    row.update(latent_distance_breakdown(system, obs_z, sim_z))
+    row.update(latent_distance_breakdown(system, obs_z, sim_z, observation_distribution(system, sample_index), sim_dist))
     if simulated_final is None:
         row.update(
             {
@@ -436,11 +497,20 @@ def run_theta_probe(
             continue
         with torch.inference_mode():
             sim_z_all = system.get_latent(system.preprocess(sims))
+        sim_dist_all = copy_distribution(system._last_latent_distribution)
         for sample_index in range(num_samples):
             obs_z = system.encoded_observational_data[
                 sample_index : sample_index + 1
             ]
             sim_z = sim_z_all[sample_index : sample_index + 1]
+            sim_dist = (
+                {
+                    key: value[sample_index : sample_index + 1]
+                    for key, value in sim_dist_all.items()
+                }
+                if sim_dist_all is not None
+                else None
+            )
             row: dict[str, object] = {
                 "label": "theta_probe",
                 "theta_index": theta_index,
@@ -448,7 +518,7 @@ def run_theta_probe(
                 "theta_beta": float(theta[1]),
                 "sample_index": sample_index,
             }
-            row.update(latent_distance_breakdown(system, obs_z, sim_z))
+            row.update(latent_distance_breakdown(system, obs_z, sim_z, observation_distribution(system, sample_index), sim_dist))
             row.update(
                 raw_grid_metrics(
                     system._initial_grids[sample_index],
@@ -469,8 +539,11 @@ def run_theta_probe(
 def summarize(probe_df: pd.DataFrame, controls_df: pd.DataFrame) -> dict[str, Any]:
     summary_cols = [
         "latent_pairwise_cosine",
+        "latent_wasserstein",
         "latent_frame0_cosine",
         "latent_frame1_cosine",
+        "latent_frame0_wasserstein",
+        "latent_frame1_wasserstein",
         "latent_l2",
         "raw_final_mismatch",
         "raw_changed_iou",
@@ -481,8 +554,11 @@ def summarize(probe_df: pd.DataFrame, controls_df: pd.DataFrame) -> dict[str, An
             "theta_alpha": "first",
             "theta_beta": "first",
             "latent_pairwise_cosine": "mean",
+            "latent_wasserstein": "mean",
             "latent_frame0_cosine": "mean",
             "latent_frame1_cosine": "mean",
+            "latent_frame0_wasserstein": "mean",
+            "latent_frame1_wasserstein": "mean",
             "latent_l2": "mean",
             "raw_final_mismatch": "mean",
             "raw_changed_iou": "mean",
@@ -502,7 +578,41 @@ def summarize(probe_df: pd.DataFrame, controls_df: pd.DataFrame) -> dict[str, An
         "corr": corr,
         "control_summary": control_summary,
         "describe": describe,
+        "validation_report": validation_report(per_theta, corr),
     }
+
+
+def validation_report(per_theta: pd.DataFrame, corr: pd.DataFrame, top_frac: float = 0.2) -> dict[str, Any]:
+    metric_cols = ["latent_pairwise_cosine", "latent_wasserstein"]
+    report: dict[str, Any] = {}
+    for metric in metric_cols:
+        corr_value = corr.loc[metric, "raw_final_mismatch"] if metric in corr.index else math.nan
+        ranked = per_theta.sort_values(metric, ascending=True)
+        top_n = max(1, int(math.ceil(len(ranked) * top_frac)))
+        top = ranked.head(top_n)
+        report[metric] = {
+            "spearman_with_raw_final_mismatch": float(corr_value),
+            "top_fraction": float(top_frac),
+            "top_n": int(top_n),
+            "top_mean_raw_final_mismatch": float(top["raw_final_mismatch"].mean()),
+            "top_mean_raw_changed_iou": float(top["raw_changed_iou"].mean()),
+            "best_theta_alpha": float(ranked.iloc[0]["theta_alpha"]),
+            "best_theta_beta": float(ranked.iloc[0]["theta_beta"]),
+            "best_raw_final_mismatch": float(ranked.iloc[0]["raw_final_mismatch"]),
+            "best_raw_changed_iou": float(ranked.iloc[0]["raw_changed_iou"]),
+        }
+
+    cosine = report["latent_pairwise_cosine"]
+    wasserstein = report["latent_wasserstein"]
+    report["wasserstein_better_than_pairwise_cosine"] = bool(
+        wasserstein["top_mean_raw_final_mismatch"] < cosine["top_mean_raw_final_mismatch"]
+    )
+    report["posterior_raw_obs_consistency_signal"] = (
+        "wasserstein_top_candidates_match_raw_obs_better"
+        if report["wasserstein_better_than_pairwise_cosine"]
+        else "no_short_probe_improvement_over_pairwise_cosine"
+    )
+    return report
 
 
 def write_outputs(
@@ -522,6 +632,8 @@ def write_outputs(
     summaries["corr"].to_csv(output_dir / "spearman_correlation.csv")
     summaries["control_summary"].to_csv(output_dir / "control_summary.csv")
     summaries["describe"].to_csv(output_dir / "theta_probe_describe.csv")
+    with (output_dir / "validation_report.json").open("w") as f:
+        json.dump(summaries["validation_report"], f, indent=2)
     if attention_df is not None:
         attention_df.to_csv(output_dir / "attention_summary.csv", index=False)
     if attention_maps is not None:
@@ -543,6 +655,7 @@ def write_outputs(
             "theta_probe_aggregated": str(output_dir / "theta_probe_aggregated.csv"),
             "theta_probe_describe": str(output_dir / "theta_probe_describe.csv"),
             "spearman_correlation": str(output_dir / "spearman_correlation.csv"),
+            "validation_report": str(output_dir / "validation_report.json"),
             "attention_summary": str(output_dir / "attention_summary.csv"),
             "attention_patch_maps": str(output_dir / "attention_patch_maps.npz"),
         },
@@ -554,6 +667,8 @@ def write_outputs(
 def main() -> None:
     args = parse_args()
     args.run_dir = args.run_dir.resolve()
+    if args.short:
+        args.n_theta = min(args.n_theta, 4)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     prior_low = parse_vector(args.prior_low)
     prior_high = parse_vector(args.prior_high)
@@ -589,8 +704,12 @@ def main() -> None:
     controls_df = run_controls(system, args.seed)
     print("running theta probe...", flush=True)
     probe_df = run_theta_probe(system, args.n_theta, args.seed, prior_low, prior_high)
-    print("running last-layer attention attribution...", flush=True)
-    attention_df, attention_maps = attention_final_to_initial_summary(system)
+    if args.short:
+        print("short mode: skipping last-layer attention attribution.", flush=True)
+        attention_df, attention_maps = None, None
+    else:
+        print("running last-layer attention attribution...", flush=True)
+        attention_df, attention_maps = attention_final_to_initial_summary(system)
     summaries = summarize(probe_df, controls_df)
     write_outputs(
         args.output_dir,
@@ -607,8 +726,11 @@ def main() -> None:
     print(summaries["control_summary"].to_string(), flush=True)
     print("spearman correlation:", flush=True)
     print(summaries["corr"].to_string(), flush=True)
-    print("attention summary:", flush=True)
-    print(attention_df.to_string(index=False), flush=True)
+    print("validation report:", flush=True)
+    print(json.dumps(summaries["validation_report"], indent=2), flush=True)
+    if attention_df is not None:
+        print("attention summary:", flush=True)
+        print(attention_df.to_string(index=False), flush=True)
     print(f"wrote outputs to: {args.output_dir}", flush=True)
 
 

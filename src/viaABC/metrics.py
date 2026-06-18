@@ -90,6 +90,42 @@ def pairwise_cosine(x, y, eps=1e-8):
     # mean over batch → scalar
     return cos_per_batch.mean()
 
+def pairwise_wasserstein_diagonal(mu_x, sigma_x, mu_y, sigma_y, eps=1e-12):
+    """
+    Squared 2-Wasserstein distance for matched diagonal Gaussians.
+
+    Inputs are expected to be shaped like latent tensors, usually (B, T, D)
+    for patch tokens. `sigma_*` is the standard deviation, not the variance.
+    Returns one distance per batch element.
+    """
+    mu_x = np.asarray(mu_x, dtype=np.float64)
+    sigma_x = np.asarray(sigma_x, dtype=np.float64)
+    mu_y = np.asarray(mu_y, dtype=np.float64)
+    sigma_y = np.asarray(sigma_y, dtype=np.float64)
+
+    if mu_x.shape != sigma_x.shape or mu_y.shape != sigma_y.shape:
+        raise ValueError("Wasserstein mu and sigma tensors must have matching shapes.")
+    if mu_x.shape[1:] != mu_y.shape[1:]:
+        raise ValueError(
+            "Wasserstein latent distributions must match after the batch dimension: "
+            f"{mu_x.shape} vs {mu_y.shape}."
+        )
+
+    if mu_x.shape[0] == 1 and mu_y.shape[0] != 1:
+        mu_x = np.broadcast_to(mu_x, mu_y.shape)
+        sigma_x = np.broadcast_to(sigma_x, sigma_y.shape)
+    elif mu_y.shape[0] == 1 and mu_x.shape[0] != 1:
+        mu_y = np.broadcast_to(mu_y, mu_x.shape)
+        sigma_y = np.broadcast_to(sigma_y, sigma_x.shape)
+
+    if mu_x.shape != mu_y.shape:
+        raise ValueError(f"Wasserstein batch shapes are not broadcastable: {mu_x.shape} vs {mu_y.shape}.")
+
+    sigma_x = np.maximum(sigma_x, eps)
+    sigma_y = np.maximum(sigma_y, eps)
+    w2_squared = np.sum((mu_x - mu_y) ** 2 + (sigma_x - sigma_y) ** 2, axis=tuple(range(1, mu_x.ndim)))
+    return np.sqrt(np.maximum(w2_squared, 0.0)).astype(np.float32)
+
 def maxSim(x, y):
     """
     x: [num_query_tokens, dim] - query embeddings (numpy array)

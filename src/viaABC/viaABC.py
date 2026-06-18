@@ -76,6 +76,8 @@ class viaABC:
         self.max_pending_simulations: Optional[int] = None
         self.max_generations: int = 0
         self.encoded_observational_data: np.ndarray = np.array([])
+        self.encoded_observational_distribution: Optional[dict[str, np.ndarray]] = None
+        self._last_latent_distribution: Optional[dict[str, np.ndarray]] = None
 
         if state0 is None:
             self.logger.warning(
@@ -133,7 +135,7 @@ class viaABC:
         if metric is None:
             raise ValueError("Metric must be provided.")
         
-        valid_metrics = ['cosine', 'l1', 'l2', 'bertscore', 'pairwise_cosine', 'bertscore_batch', 'maxSim']
+        valid_metrics = ['cosine', 'l1', 'l2', 'bertscore', 'pairwise_cosine', 'bertscore_batch', 'maxSim', 'wasserstein', 'pairwise_wasserstein']
 
         if metric in valid_metrics:
             self.metric = metric
@@ -305,6 +307,13 @@ class viaABC:
             distances = np.array([1 - bert_score_batch(x, sample[np.newaxis, ...]) for sample in y], dtype=np.float32)
         elif self.metric == "maxSim":
             distances = np.array([maxSim(x, sample[np.newaxis, ...]) for sample in y], dtype=np.float32)
+        elif self.metric in {"wasserstein", "pairwise_wasserstein"}:
+            distances = pairwise_wasserstein_diagonal(
+                self.encoded_observational_distribution["mu"],
+                self.encoded_observational_distribution["sigma"],
+                self._last_latent_distribution["mu"],
+                self._last_latent_distribution["sigma"],
+            )
         else:
             raise ValueError(f"Unsupported metric: {self.metric}")
 
@@ -319,6 +328,7 @@ class viaABC:
         # every iteration.
         scaled_data = self.preprocess(self.raw_observational_data)
         self.encoded_observational_data = self.get_latent(scaled_data)
+        self.encoded_observational_distribution = self._last_latent_distribution
     
     def _log_generation_stats(self, t: int, particles: np.ndarray, weights: np.ndarray, start_time: float, num_simulations: int, epsilon: float, quantile: Union[float, None] = None):
         duration = time.time() - start_time
@@ -1502,12 +1512,66 @@ class viaABC:
         if x.ndim == 2:
             x = x.unsqueeze(0)
         x = self.model.get_latent(x, self.pooling_method)
+        self._cache_last_latent_distribution(x)
 
         # if x is tensor convert to numpy, safeguard
         if isinstance(x, torch.Tensor):
             x = x.cpu().numpy()
         
         return x
+
+    def _cache_last_latent_distribution(self, latent: torch.Tensor | np.ndarray) -> None:
+        latent_tensor = latent if isinstance(latent, torch.Tensor) else None
+        latent_module = self._find_latent_module()
+        if latent_module is None or latent_tensor is None:
+            self._last_latent_distribution = None
+            return
+
+        mu = getattr(latent_module, "latent_mean", None)
+        logvar = getattr(latent_module, "latent_logvar", None)
+        if mu is None or logvar is None:
+            self._last_latent_distribution = None
+            return
+
+        mu = self._align_latent_distribution_tensor(mu, latent_tensor)
+        logvar = self._align_latent_distribution_tensor(logvar, latent_tensor)
+        sigma = torch.exp(0.5 * logvar).clamp_min(1e-12)
+        self._last_latent_distribution = {
+            "mu": mu.detach().cpu().numpy(),
+            "sigma": sigma.detach().cpu().numpy(),
+        }
+
+    def _find_latent_module(self) -> Optional[torch.nn.Module]:
+        model = getattr(self.model, "model", self.model)
+        decoder_embed = getattr(model, "decoder_embed", None)
+        if decoder_embed is None:
+            return None
+        if hasattr(decoder_embed, "latent_mean") and hasattr(decoder_embed, "latent_logvar"):
+            return decoder_embed
+        if isinstance(decoder_embed, torch.nn.Sequential):
+            for module in decoder_embed:
+                if hasattr(module, "latent_mean") and hasattr(module, "latent_logvar"):
+                    return module
+        return None
+
+    def _align_latent_distribution_tensor(
+        self,
+        value: torch.Tensor,
+        latent: torch.Tensor,
+    ) -> torch.Tensor:
+        if value.shape == latent.shape:
+            return value
+        if latent.ndim == 2 and value.ndim == 3 and self.pooling_method == "cls":
+            return value[:, 0, :]
+        if latent.ndim == 3 and value.ndim == 3 and value.shape[1] == latent.shape[1] + 1:
+            return value[:, 1:, :]
+        if latent.ndim == 2 and value.ndim == 3 and self.pooling_method == "mean":
+            return value[:, 1:, :].mean(dim=1)
+        raise ValueError(
+            "Unable to align VAE latent distribution with encoded latent output: "
+            f"distribution={tuple(value.shape)}, latent={tuple(latent.shape)}, "
+            f"pooling_method={self.pooling_method!r}."
+        )
     
     def preprocess(self, x: np.ndarray) -> np.ndarray:
         raise NotImplementedError

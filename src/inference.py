@@ -177,6 +177,12 @@ def inject_training_observation_samples(cfg: DictConfig, train_cfg: DictConfig) 
         observation_samples,
         merge=False,
     )
+    OmegaConf.update(
+        cfg,
+        "system.observation_samples",
+        observation_samples,
+        merge=False,
+    )
     log.info("Injected Spatial2D observation samples from training run config")
 
 

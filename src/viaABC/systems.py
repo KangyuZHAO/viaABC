@@ -8,13 +8,14 @@ from PIL import Image
 from hydra import compose, initialize_config_dir
 from hydra.core.hydra_config import HydraConfig
 import sys
+from omegaconf import OmegaConf
 
 import rootutils
 import hydra
 from scipy.ndimage import convolve
 from scipy.stats import lognorm, uniform
 
-from src.viaABC.metrics import bert_score, bert_score_batch, cosine_similarity, l1_distance, l2_distance, maxSim, pairwise_cosine
+from src.viaABC.metrics import bert_score, bert_score_batch, cosine_similarity, l1_distance, l2_distance, maxSim, pairwise_cosine, pairwise_wasserstein_diagonal
 from src.viaABC.viaABC import viaABC
 
 log = logging.getLogger(__name__)
@@ -100,7 +101,8 @@ class Spatial2D(viaABC):
         transform: Any = None,
         use_time_series: bool = True,
         num_frames: int | None = None,
-        sample_id: str | Sequence[str] | None = ["sample_1", "sample_2", "sample_3", "sample_4"]) -> None:
+        sample_id: str | Sequence[str] | None = ["sample_1", "sample_2", "sample_3", "sample_4"],
+        observation_samples: Mapping[str, Mapping[str, Any]] | None = None) -> None:
 
         self.transform = transform
         self.use_time_series = use_time_series
@@ -110,7 +112,12 @@ class Spatial2D(viaABC):
         self._cython_cores: list[Any] | None = None
         self._last_simulation_sample_index = 0
         self._sample_source_info: list[dict[str, Any]] = []
-        sample_paths = self._load_spatial2d_samples()
+        if observation_samples is None:
+            sample_paths = self._load_spatial2d_samples()
+        elif OmegaConf.is_config(observation_samples):
+            sample_paths = OmegaConf.to_container(observation_samples, resolve=True)
+        else:
+            sample_paths = observation_samples
         sample_ids = [sample_id] if isinstance(sample_id, str) else list(sample_id or [])
         if not sample_ids:
             raise ValueError("sample_id must be a sample name or a non-empty list of sample names.")
@@ -457,6 +464,7 @@ class Spatial2D(viaABC):
         observation_input = self._observation_input()
         scaled_data = self.preprocess(observation_input)
         self.encoded_observational_data = self.get_latent(scaled_data)
+        self.encoded_observational_distribution = self._last_latent_distribution
 
     def _observation_input(self) -> np.ndarray:
         if not self._uses_temporal_encoder():
@@ -486,8 +494,14 @@ class Spatial2D(viaABC):
             raise ValueError(f"Expected Spatial2D model input with {expected_ndim - 1} or {expected_ndim} dims, got {tuple(x.shape)}")
 
         x = self.model.get_latent(x, self.pooling_method)
+        self._cache_last_latent_distribution(x)
         if sample_batch_shape is not None:
             x = x.reshape(*sample_batch_shape, *x.shape[1:])
+            if self._last_latent_distribution is not None:
+                self._last_latent_distribution = {
+                    key: value.reshape(*sample_batch_shape, *value.shape[1:])
+                    for key, value in self._last_latent_distribution.items()
+                }
         return x.cpu().numpy() if isinstance(x, torch.Tensor) else x
 
     def _temporal_frame_count(self) -> int:
@@ -533,6 +547,9 @@ class Spatial2D(viaABC):
 
         x = self.encoded_observational_data
         y = np.asarray(y)
+        if self.metric in {"wasserstein", "pairwise_wasserstein"}:
+            return self._calculate_multisample_wasserstein_distance(y)
+
         if y.ndim >= 3 and y.shape[1] == x.shape[0]:
             return np.asarray(
                 [
@@ -583,6 +600,38 @@ class Spatial2D(viaABC):
         if self.metric == "maxSim":
             return float(maxSim(x, y))
         raise ValueError(f"Unsupported metric: {self.metric}")
+
+    def _calculate_multisample_wasserstein_distance(self, y: np.ndarray) -> float | np.ndarray:
+        obs_mu = self.encoded_observational_distribution["mu"]
+        obs_sigma = self.encoded_observational_distribution["sigma"]
+        sim_mu = self._last_latent_distribution["mu"]
+        sim_sigma = self._last_latent_distribution["sigma"]
+
+        if y.ndim >= 3 and y.shape[1] == self.encoded_observational_data.shape[0]:
+            distances = []
+            for batch_index in range(y.shape[0]):
+                sample_distances = pairwise_wasserstein_diagonal(
+                    obs_mu,
+                    obs_sigma,
+                    sim_mu[batch_index],
+                    sim_sigma[batch_index],
+                )
+                distances.append(float(np.mean(sample_distances)))
+            return np.asarray(distances, dtype=np.float32)
+
+        if y.shape[0] != self.encoded_observational_data.shape[0]:
+            sample_index = self._last_simulation_sample_index
+            return float(
+                pairwise_wasserstein_diagonal(
+                    obs_mu[sample_index:sample_index + 1],
+                    obs_sigma[sample_index:sample_index + 1],
+                    sim_mu[:1],
+                    sim_sigma[:1],
+                )[0]
+            )
+
+        sample_distances = pairwise_wasserstein_diagonal(obs_mu, obs_sigma, sim_mu, sim_sigma)
+        return float(np.mean(sample_distances))
     
 class SpatialSIR3D(viaABC):
     def __init__(self,

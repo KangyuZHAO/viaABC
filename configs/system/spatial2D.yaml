@@ -10,3 +10,4 @@ system:
   time_space: [0, 24]
   num_frames: 2
   sample_id: ${data.observation_sample}
+  observation_samples: ${data.observation_samples}
