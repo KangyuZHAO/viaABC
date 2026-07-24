@@ -1,0 +1,28 @@
+[project]
+name = "viaabc"
+version = "0.1.0"
+description = "Vision-informed Approximate Bayesian Computation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "numpy",
+  "scipy",
+  "PyYAML",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+torch = ["torch"]
+tracking = ["mlflow"]
+dev = ["pytest"]
+
+[project.scripts]
+viaabc = "viaabc.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

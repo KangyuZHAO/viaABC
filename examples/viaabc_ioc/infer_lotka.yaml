@@ -1,0 +1,48 @@
+experiment:
+  name: lotka_ioc_example
+  seed: 42
+
+system:
+  target: examples.viaabc_ioc.lotka_system.LotkaSystem
+  params: {}
+
+prior:
+  params:
+    alpha:
+      type: uniform
+      low: 0.0
+      high: 10.0
+    delta:
+      type: uniform
+      low: 0.0
+      high: 10.0
+
+encoder:
+  name: encoder.identity
+  params: {}
+
+distance:
+  name: l2
+
+observed_data:
+  path: examples/viaabc_ioc/lotka_observed.csv
+  loader: csv
+
+abc:
+  num_particles: 100
+  k: 3
+  q_threshold: 0.99
+  max_generations: 3
+  epsilon_quantile: 0.5
+  num_workers: 4
+  simulation_batch_size: 16
+  distance: l2
+
+runtime:
+  name: runtime.auto
+
+tracking:
+  backend: null
+
+output:
+  dir: outputs/lotka_ioc_example

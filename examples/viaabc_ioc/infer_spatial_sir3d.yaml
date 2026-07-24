@@ -1,0 +1,55 @@
+experiment:
+  name: spatial_sir3d_ioc_example
+  seed: 13
+
+system:
+  target: examples.viaabc_ioc.spatial_sir3d_system.SpatialSIR3DSystem
+  params:
+    grid_size: 24
+    time_space: [1.0, 2.0, 3.0, 4.0]
+    radius: 3
+    seed: 11
+
+prior:
+  params:
+    beta:
+      type: uniform
+      low: 0.2
+      high: 2.0
+    tau_I:
+      type: uniform
+      low: 0.5
+      high: 2.2
+
+encoder:
+  name: encoder.identity
+  params: {}
+
+distance:
+  name: l2
+
+observed_data:
+  path: outputs/viaabc_ioc_smoke/spatial_sir3d_observed.npy
+  loader: numpy
+
+abc:
+  num_particles: 20
+  k: 2
+  q_threshold: 0.999
+  max_generations: 2
+  epsilon_quantile: 0.5
+  num_workers: 4
+  simulation_batch_size: 8
+  distance: l2
+  seed: 13
+
+runtime:
+  name: runtime.cpu
+  params:
+    num_workers: 4
+
+tracking:
+  backend: null
+
+output:
+  dir: outputs/spatial_sir3d_ioc_example
